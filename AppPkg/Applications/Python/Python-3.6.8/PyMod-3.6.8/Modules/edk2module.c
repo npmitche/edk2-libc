@@ -29,6 +29,7 @@
 #include  <Library/UefiRuntimeServicesTableLib.h>
 #include  <Library/UefiBootServicesTableLib.h>
 #include  <Protocol/MpService.h>
+#include  <Protocol/MemoryAttribute.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -4491,29 +4492,51 @@ MiscRT_GetVariable(PyObject *self, PyObject *args)
   PyObject     *data_out;
   CHAR16       *VariableName;
   EFI_GUID      VendorGuid;
-  UINT32        GuidSize;
-  UINT32        Attributes;
-  UINT64        DataSize;
+  Py_ssize_t    GuidSize;
+  UINT32        Attributes = 0;
+    Py_ssize_t    DataSizeIn;
+  UINTN         DataSize;
   char         *Data;
   const CHAR16 *GuidIn;
   EFI_STATUS    Status;
 
-  if(!PyArg_ParseTuple(args, "uu#K", &VariableName, &GuidIn, &GuidSize, &DataSize))
+  //
+  // PY_SSIZE_T_CLEAN is defined for this file, so the length argument of the
+  // 'u#' unit is Py_ssize_t, not int/UINT32.
+  //
+    if(!PyArg_ParseTuple(args, "uu#n", &VariableName, &GuidIn, &GuidSize, &DataSizeIn))
   {
     return NULL;
   }
 
-  StrToGuid(GuidIn, &VendorGuid);
+    if (DataSizeIn < 0) {
+        PyErr_SetString(PyExc_ValueError, "DataSize must be non-negative");
+        return NULL;
+    }
+    if (GuidSize != 36 || RETURN_ERROR(StrToGuid(GuidIn, &VendorGuid))) {
+        PyErr_SetString(PyExc_ValueError, "GUID must be a valid 36-character GUID");
+        return NULL;
+    }
 
-  Data = malloc(DataSize);
+  DataSize = (UINTN)DataSizeIn;
+  Data = malloc(DataSize > 0 ? DataSize : 1);
   if (!Data)
-    return NULL;
+    return PyErr_NoMemory();
 
   Py_BEGIN_ALLOW_THREADS
-  Status = gRT->GetVariable(VariableName, &VendorGuid, &Attributes, (UINTN *)&DataSize, (void*)Data);
+  Status = gRT->GetVariable(VariableName, &VendorGuid, &Attributes, &DataSize, (void*)Data);
   Py_END_ALLOW_THREADS
 
-  data_out = Py_BuildValue("(IIy#K)", (UINT32)Status, Attributes, Data, DataSize, DataSize);
+  //
+  // On error nothing was written to Data. In particular EFI_BUFFER_TOO_SMALL
+  // updates DataSize to the *required* size, which is larger than the buffer we
+  // allocated, so returning Data with that length would read past the end of it.
+  //
+  if (EFI_ERROR(Status)) {
+    data_out = Py_BuildValue("(IIy#K)", (UINT32)Status, Attributes, "", (Py_ssize_t)0, (UINT64)DataSize);
+  } else {
+    data_out = Py_BuildValue("(IIy#K)", (UINT32)Status, Attributes, Data, (Py_ssize_t)DataSize, (UINT64)DataSize);
+  }
   free(Data);
 
   return data_out;
@@ -4527,60 +4550,262 @@ static
 PyObject *
 MiscRT_GetNextVariableName(PyObject *self, PyObject *args)
 {
-  UINT64        NameSize;
+  PyObject     *result;
+    Py_ssize_t    NameSizeIn;
+  UINTN         NameSize;
   CHAR16       *VariableName, *NameIn;
-  UINT32        GuidSize, VariableNameSize, i;
+  Py_ssize_t    NameInSize, GuidSize, i;
   EFI_GUID      VendorGuid;
   EFI_STATUS    Status;
   const char   *GuidIn;
-  char         *VendorGuidPtr, *GuidOut[37];
+  char         *VendorGuidPtr;
+  char          GuidOut[37];
 
-  if(!PyArg_ParseTuple(args, "Ky#s#", &NameSize, &NameIn, &VariableNameSize, &GuidIn, &GuidSize))
+  //
+  // PY_SSIZE_T_CLEAN is defined for this file, so the length arguments of the
+  // 'y#' and 's#' units are Py_ssize_t, not int/UINT32.
+  //
+    if(!PyArg_ParseTuple(args, "ny#s#", &NameSizeIn, &NameIn, &NameInSize, &GuidIn, &GuidSize))
   {
     return NULL;
   }
 
+    // Use checked, native signed sizes, not the masking 'K' conversion. Leave
+    // room for the terminator without overflowing Py_ssize_t or UINTN.
+    if (NameSizeIn < 0 || NameInSize > PY_SSIZE_T_MAX - (Py_ssize_t)sizeof(CHAR16)) {
+        PyErr_SetString(PyExc_ValueError, "invalid variable name buffer size");
+        return NULL;
+    }
+    if (NameInSize % sizeof(CHAR16) != 0) {
+        PyErr_SetString(PyExc_ValueError, "variable name must contain complete CHAR16 units");
+        return NULL;
+    }
+
+  if (GuidSize < (Py_ssize_t)sizeof(VendorGuid)) {
+    PyErr_SetString(PyExc_ValueError, "GUID must be at least 16 bytes");
+    return NULL;
+  }
+
   VendorGuidPtr = (char *)&VendorGuid;
-  for (i=0; i<sizeof(VendorGuid); i++)
+  for (i=0; i<(Py_ssize_t)sizeof(VendorGuid); i++)
     VendorGuidPtr[i] = GuidIn[i];
 
-  for (i=0; i<NameSize && NameIn[i] != (CHAR16)0; i++)
+  //
+  // GetNextVariableName() writes the next name into VariableName, so it must be
+  // a real buffer of at least NameSize bytes and must also be able to hold the
+  // name we were handed. The original code left VariableName uninitialized.
+  //
+  NameSize = (UINTN)NameSizeIn;
+  if (NameSize < (UINTN)NameInSize + sizeof(CHAR16)) {
+    NameSize = (UINTN)NameInSize + sizeof(CHAR16);
+  }
+
+  VariableName = malloc(NameSize);
+  if (VariableName == NULL) {
+    return PyErr_NoMemory();
+  }
+
+  for (i=0; i<NameInSize/(Py_ssize_t)sizeof(CHAR16) && NameIn[i] != (CHAR16)0; i++)
     VariableName[i] = NameIn[i];
-  VariableName[i] = NameIn[i];
+  VariableName[i] = (CHAR16)0;
 
   Py_BEGIN_ALLOW_THREADS
-  Status = gRT->GetNextVariableName((UINTN *)&NameSize, (CHAR16 *)VariableName, &VendorGuid);
+  Status = gRT->GetNextVariableName(&NameSize, VariableName, &VendorGuid);
   Py_END_ALLOW_THREADS
 
   GuidToStr((EFI_GUID *)&VendorGuid, (UINT8 *)GuidOut);
 
-  return Py_BuildValue("(IuKs)", (UINT32) Status, VariableName, NameSize, &GuidOut);
+  //
+  // On error (including EFI_BUFFER_TOO_SMALL) nothing was written to the buffer.
+  // Still report NameSize so the caller can retry with a large enough buffer.
+  //
+  if (EFI_ERROR(Status)) {
+    result = Py_BuildValue("(IuKs)", (UINT32) Status, L"", (UINT64)NameSize, GuidOut);
+  } else {
+    result = Py_BuildValue("(IuKs)", (UINT32) Status, VariableName, (UINT64)NameSize, GuidOut);
+  }
+
+  free(VariableName);
+
+  return result;
+}
+
+PyDoc_STRVAR(MiscBS_GetSystemTable__doc__,
+"Address = GetSystemTable()\n\n\
+Returns the address of the EFI System Table. Callers would otherwise have to\n\
+brute-force scan memory for the 'IBI SYST' signature, which is both slow and\n\
+unsafe on firmware that leaves regions unmapped.");
+
+static
+PyObject *
+MiscBS_GetSystemTable(PyObject *self, PyObject *args)
+{
+  return Py_BuildValue("K", (UINT64)(UINTN)gST);
+}
+
+PyDoc_STRVAR(MiscBS_GetMemoryMap__doc__,
+"(Status, Entries) = GetMemoryMap()\n\n\
+Returns the UEFI memory map as a list of\n\
+(Type, PhysicalStart, NumberOfPages, Attribute) tuples.");
+
+static
+PyObject *
+MiscBS_GetMemoryMap(PyObject *self, PyObject *args)
+{
+  EFI_MEMORY_DESCRIPTOR  *MemoryMap = NULL;
+  EFI_MEMORY_DESCRIPTOR  *Desc;
+  UINTN                   MapSize = 0;
+  UINTN                   MapKey = 0;
+  UINTN                   DescriptorSize = 0;
+  UINT32                  DescriptorVersion = 0;
+  UINTN                   Index, Count;
+  EFI_STATUS              Status;
+  PyObject               *list, *item;
+
+  //
+  // First call sizes the buffer. Ask for extra room because allocating the
+  // buffer can itself add descriptors to the map.
+  //
+  Status = gBS->GetMemoryMap(&MapSize, NULL, &MapKey, &DescriptorSize, &DescriptorVersion);
+  if (Status != EFI_BUFFER_TOO_SMALL) {
+    return Py_BuildValue("(IN)", (UINT32)Status, PyList_New(0));
+  }
+
+  MapSize += 8 * DescriptorSize;
+  MemoryMap = malloc(MapSize);
+  if (MemoryMap == NULL) {
+    return PyErr_NoMemory();
+  }
+
+  Py_BEGIN_ALLOW_THREADS
+  Status = gBS->GetMemoryMap(&MapSize, MemoryMap, &MapKey, &DescriptorSize, &DescriptorVersion);
+  Py_END_ALLOW_THREADS
+
+  if (EFI_ERROR(Status) || DescriptorSize == 0) {
+    free(MemoryMap);
+    return Py_BuildValue("(IN)", (UINT32)Status, PyList_New(0));
+  }
+
+  list = PyList_New(0);
+  if (list == NULL) {
+    free(MemoryMap);
+    return NULL;
+  }
+
+  Count = MapSize / DescriptorSize;
+  for (Index = 0; Index < Count; Index++) {
+    //
+    // Descriptors are DescriptorSize apart, which is not necessarily
+    // sizeof(EFI_MEMORY_DESCRIPTOR), so step with a byte pointer.
+    //
+    Desc = (EFI_MEMORY_DESCRIPTOR *)((UINT8 *)MemoryMap + (Index * DescriptorSize));
+    item = Py_BuildValue("(IKKK)",
+                         (UINT32)Desc->Type,
+                         (UINT64)Desc->PhysicalStart,
+                         (UINT64)Desc->NumberOfPages,
+                         (UINT64)Desc->Attribute);
+    if (item == NULL) {
+      Py_DECREF(list);
+      free(MemoryMap);
+      return NULL;
+    }
+    if (PyList_Append(list, item) != 0) {
+      Py_DECREF(item);
+      Py_DECREF(list);
+      free(MemoryMap);
+      return NULL;
+    }
+    Py_DECREF(item);
+  }
+
+  free(MemoryMap);
+
+  return Py_BuildValue("(IN)", (UINT32)Status, list);
+}
+
+PyDoc_STRVAR(MiscBS_GetMemoryAttributes__doc__,
+"(Status, Attributes) = GetMemoryAttributes(Address, Length)\n\n\
+Queries the page attributes of a physical range via\n\
+EFI_MEMORY_ATTRIBUTE_PROTOCOL. EFI_NO_MAPPING (0x11) means attributes are\n\
+inconsistent across the range, not that the range is unmapped. This is not\n\
+a mapped/unmapped memory-access oracle. EFI_UNSUPPORTED (0x3) is returned\n\
+when firmware does not provide the protocol. Status is truncated to UINT32;\n\
+on 64-bit firmware the EFI error bit is omitted. Attributes are valid only\n\
+on success.");
+
+static
+PyObject *
+MiscBS_GetMemoryAttributes(PyObject *self, PyObject *args)
+{
+  EFI_MEMORY_ATTRIBUTE_PROTOCOL  *MemoryAttribute = NULL;
+  UINT64                          Address, Length, Attributes = 0;
+  EFI_STATUS                      Status;
+
+  if (!PyArg_ParseTuple(args, "KK", &Address, &Length)) {
+    return NULL;
+  }
+
+  Status = gBS->LocateProtocol(&gEfiMemoryAttributeProtocolGuid, NULL, (VOID **)&MemoryAttribute);
+  if (EFI_ERROR(Status) || MemoryAttribute == NULL) {
+    //
+    // Firmware without the protocol cannot be interrogated; the caller is
+    // expected to fall back to the memory map.
+    //
+    return Py_BuildValue("(IK)", (UINT32)EFI_UNSUPPORTED, (UINT64)0);
+  }
+
+  Py_BEGIN_ALLOW_THREADS
+  Status = MemoryAttribute->GetMemoryAttributes(MemoryAttribute,
+                                                (EFI_PHYSICAL_ADDRESS)Address,
+                                                (UINT64)Length,
+                                                &Attributes);
+  Py_END_ALLOW_THREADS
+
+  return Py_BuildValue("(IK)", (UINT32)Status, (UINT64)Attributes);
 }
 
 PyDoc_STRVAR(MiscRT_SetVariable__doc__,
 "(Status, DataSize, GUID) = SetVariable(VariableName, GUID, Attributes, Data, DataSize)\n\n\
-Sets the value of a variable.");
+Sets the value of a variable. DataSize must be non-negative and no greater\n\
+than the supplied data length; invalid sizes raise ValueError. An explicit\n\
+zero size requests UEFI zero-length semantics (normally variable deletion).");
 
 static
 PyObject *
 MiscRT_SetVariable(PyObject *self, PyObject *args)
 {
   CHAR16       *VariableName;
-  UINT64        DataSize;
-  char         *Data, *guidptr, *VendorGuidPtr;
-  char         *GuidOut[37];
+    Py_ssize_t    DataSize;
+  char         *Data;
+  char          GuidOut[37];
   EFI_STATUS    Status;
   EFI_GUID      VendorGuid;
   UINT32        Attributes;
-  UINT32        GuidSize, strDataSize;
+  Py_ssize_t    GuidSize, strDataSize;
   const CHAR16 *GuidIn;
 
-  if(!PyArg_ParseTuple(args, "uu#Is#I", &VariableName, &GuidIn, &GuidSize, &Attributes, &Data, &strDataSize, &DataSize))
+  //
+  // PY_SSIZE_T_CLEAN is defined for this file, so the length arguments of the
+  // 'u#' and 's#' units are Py_ssize_t, not int/UINT32.
+  //
+    if(!PyArg_ParseTuple(args, "uu#Is#n", &VariableName, &GuidIn, &GuidSize, &Attributes, &Data, &strDataSize, &DataSize))
   {
     return NULL;
   }
 
-  StrToGuid(GuidIn, &VendorGuid);
+  //
+    // Reject invalid sizes rather than silently truncating a persistent write
+    // or turning a nonzero request into a zero-length variable deletion.
+  //
+    if (DataSize < 0 || DataSize > strDataSize) {
+        PyErr_SetString(PyExc_ValueError, "DataSize must be between zero and the supplied data length");
+        return NULL;
+  }
+
+    if (GuidSize != 36 || RETURN_ERROR(StrToGuid(GuidIn, &VendorGuid))) {
+        PyErr_SetString(PyExc_ValueError, "GUID must be a valid 36-character GUID");
+        return NULL;
+    }
 
   Py_BEGIN_ALLOW_THREADS
   Status = gRT->SetVariable(VariableName, &VendorGuid, Attributes, (UINTN)DataSize, (void*)Data);
@@ -4588,8 +4813,7 @@ MiscRT_SetVariable(PyObject *self, PyObject *args)
 
   GuidToStr((EFI_GUID *)&VendorGuid, (UINT8 *)GuidOut);
 
-//   return Py_BuildValue("(IKu#)", (UINT32) Status, DataSize, &VendorGuid, sizeof(VendorGuid));
-  return Py_BuildValue("(IKs)", (UINT32) Status, DataSize, &GuidOut);
+    return Py_BuildValue("(IKs)", (UINT32) Status, (UINT64)DataSize, GuidOut);
 }
 
 
@@ -4912,6 +5136,9 @@ static PyMethodDef edk2_methods[] = {
     {"GetVariable",         MiscRT_GetVariable,          METH_VARARGS, MiscRT_GetVariable__doc__},
     {"GetNextVariableName", MiscRT_GetNextVariableName,  METH_VARARGS, MiscRT_GetNextVariableName__doc__},
     {"SetVariable",         MiscRT_SetVariable,          METH_VARARGS, MiscRT_SetVariable__doc__},
+    {"GetMemoryMap",        MiscBS_GetMemoryMap,         METH_NOARGS,  MiscBS_GetMemoryMap__doc__},
+    {"GetSystemTable",      MiscBS_GetSystemTable,       METH_NOARGS,  MiscBS_GetSystemTable__doc__},
+    {"GetMemoryAttributes", MiscBS_GetMemoryAttributes,  METH_VARARGS, MiscBS_GetMemoryAttributes__doc__},
     {NULL,              NULL}            /* Sentinel */
 };
 

@@ -44,11 +44,13 @@
   LibNetUtil
   DevMedia
   PciLib
+  CacheMaintenanceLib
   #BsdSocketLib
   #EfiSocketLib
 
 [Protocols]
   gEfiMpServiceProtocolGuid           ## CONSUMES
+  gEfiMemoryAttributeProtocolGuid     ## CONSUMES
 
 [FixedPcd]
   gEfiMdePkgTokenSpaceGuid.PcdDebugPropertyMask|0x0F
